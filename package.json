@@ -1,0 +1,8 @@
+{
+  "name": "crest-vercel-dashboard",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "openai": "^4.0.0"
+  }
+}
