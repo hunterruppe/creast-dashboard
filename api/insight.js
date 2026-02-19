@@ -16,7 +16,7 @@ async function finnhub(path, params = {}) {
   const r = await fetch(url.toString(), { headers: { accept: "application/json" } });
   const ct = (r.headers.get("content-type") || "").toLowerCase();
 
-  let payload = null;
+  let payload;
   try {
     payload = ct.includes("application/json") ? await r.json() : await r.text();
   } catch {
@@ -28,8 +28,8 @@ async function finnhub(path, params = {}) {
       payload && payload.error
         ? payload.error
         : typeof payload === "string"
-        ? payload
-        : JSON.stringify(payload);
+          ? payload
+          : JSON.stringify(payload);
     throw new Error(`Finnhub ${r.status}: ${msg}`);
   }
 
@@ -40,23 +40,27 @@ function isoDate(d) {
   return d.toISOString().slice(0, 10);
 }
 
+function num(n, digits = 2) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return null;
+  return Number(x.toFixed(digits));
+}
+
 export default async function handler(req, res) {
   try {
     if (!OPENAI_API_KEY) return res.status(500).json({ error: "Server missing OPENAI_API_KEY env var" });
     if (!FINNHUB_TOKEN) return res.status(500).json({ error: "Server missing FINNHUB_TOKEN env var" });
 
-    const url = new URL(req.url, `https://${req.headers.host}`);
-    const symbol = String(url.searchParams.get("symbol") || "").trim().toUpperCase();
+    const symbol = String(req.query.symbol || "").trim().toUpperCase();
     if (!symbol) return res.status(400).json({ error: "Missing symbol" });
 
-    // Time windows
     const now = new Date();
     const fromNews = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
     const fromEarnings = new Date(now.getTime() - 120 * 24 * 60 * 60 * 1000);
     const toEarnings = new Date(now.getTime() + 120 * 24 * 60 * 60 * 1000);
     const fromInsider = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000);
 
-    // Pull Finnhub data (best-effort; don’t fail whole request if one endpoint fails)
+    // Pull Finnhub data (ignore failures per-endpoint so the AI still works with partial data)
     const [
       quote,
       profile,
@@ -75,28 +79,53 @@ export default async function handler(req, res) {
       finnhub("/stock/insider-transactions", { symbol, from: isoDate(fromInsider), to: isoDate(now) }).catch(() => ({})),
     ]);
 
+    // Make the facts compact + safe
     const topNews = Array.isArray(companyNews)
       ? companyNews.slice(0, 10).map((n) => ({
-          headline: n.headline,
-          source: n.source,
-          datetime: n.datetime,
-          url: n.url,
-          summary: n.summary,
+          headline: n?.headline || "",
+          source: n?.source || "",
+          datetime: n?.datetime || null,
+          url: n?.url || "",
+          summary: n?.summary || "",
         }))
       : [];
 
     const facts = {
       symbol,
-      quote,
-      profile,
+      quote: quote
+        ? {
+            current: num(quote.c, 2),
+            change: num(quote.d, 2),
+            percentChange: num(quote.dp, 2),
+            high: num(quote.h, 2),
+            low: num(quote.l, 2),
+            open: num(quote.o, 2),
+            prevClose: num(quote.pc, 2),
+          }
+        : null,
+      profile: {
+        name: profile?.name || null,
+        ticker: profile?.ticker || symbol,
+        exchange: profile?.exchange || null,
+        finnhubIndustry: profile?.finnhubIndustry || null,
+        weburl: profile?.weburl || null,
+      },
       news: topNews,
-      earningsCalendar: earningsCal?.earningsCalendar || [],
+      earningsCalendar: earningsCal?.earningsCalendar || null,
       recommendationTrend: Array.isArray(recTrend) ? recTrend.slice(0, 2) : [],
-      priceTarget,
-      insiderTransactions: insiderTx?.data ? insiderTx.data.slice(0, 3) : [],
+      priceTarget: priceTarget
+        ? {
+            targetHigh: num(priceTarget.targetHigh, 2),
+            targetLow: num(priceTarget.targetLow, 2),
+            targetMean: num(priceTarget.targetMean, 2),
+            targetMedian: num(priceTarget.targetMedian, 2),
+            lastUpdated: priceTarget.lastUpdated || null,
+          }
+        : null,
+      insiderTransactions: Array.isArray(insiderTx?.data) ? insiderTx.data.slice(0, 3) : [],
     };
 
-    // JSON Schema the model must follow
+    // JSON schema the model must return
     const schema = {
       type: "object",
       additionalProperties: false,
@@ -139,7 +168,7 @@ export default async function handler(req, res) {
       goal: "Generate a Robinhood-style 'Insight' story that explains why the stock is moving today.",
       rules: [
         "Use ONLY the provided facts. DO NOT invent events, numbers, deals, or dates.",
-        "If facts are insufficient to explain the move, say 'No clear single driver' and focus on what IS known (e.g., earnings, guidance, analyst changes, macro).",
+        "If facts are insufficient to explain the move, say 'No clear single driver' and focus on what IS known (e.g., upcoming earnings, recent news, analyst changes).",
         "Short punchy writing. No more than 2 sentences per section.",
         "Headings should be short (2–6 words).",
         "When you mention a headline, include it in citations with its URL.",
@@ -147,7 +176,7 @@ export default async function handler(req, res) {
       facts,
     };
 
-    // ✅ Correct OpenAI call (fixes the 'text.format.name' error)
+    // ✅ CORRECT OpenAI call (uses response_format, NOT text.format)
     const response = await openai.responses.create({
       model: "gpt-4o-mini",
       input: [
@@ -164,19 +193,18 @@ export default async function handler(req, res) {
         type: "json_schema",
         json_schema: {
           name: "insight",
-          schema: schema,
+          schema,
         },
       },
     });
 
     const out = JSON.parse(response.output_text);
 
-    // Basic cache headers
+    // Basic cache headers (Vercel edge/cacheable by browser/CDN for a short time)
     res.setHeader("Cache-Control", "s-maxage=60, stale-while-revalidate=120");
     return res.status(200).json(out);
   } catch (e) {
     return res.status(500).json({ error: e?.message || String(e) });
   }
 }
-
 
