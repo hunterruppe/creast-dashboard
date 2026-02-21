@@ -35,15 +35,13 @@ async function finnhub(path, params = {}) {
   return payload;
 }
 
-function startOfTodayISO() {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return d.toISOString().slice(0, 10);
-}
-
 function isoDaysAgo(n) {
   const d = new Date(Date.now() - n * 24 * 60 * 60 * 1000);
   return d.toISOString().slice(0, 10);
+}
+
+function isoToday() {
+  return new Date().toISOString().slice(0, 10);
 }
 
 export default async function handler(req, res) {
@@ -55,75 +53,77 @@ export default async function handler(req, res) {
       return res.status(500).json({ error: "Missing OPENAI_API_KEY env var in Vercel" });
     }
 
-    // ---- Pull context from Finnhub (lightweight + fast) ----
-    const today = startOfTodayISO();
+    // ---------- Finnhub context ----------
     const from = isoDaysAgo(7);
+    const to = isoToday();
 
     const [quote, profile, recs, pt, news] = await Promise.all([
       finnhub("/quote", { symbol }).catch(() => null),
       finnhub("/stock/profile2", { symbol }).catch(() => ({})),
       finnhub("/stock/recommendation", { symbol }).catch(() => []),
       finnhub("/stock/price-target", { symbol }).catch(() => null),
-      finnhub("/company-news", { symbol, from, to: today }).catch(() => []),
+      finnhub("/company-news", { symbol, from, to }).catch(() => []),
     ]);
 
     const topNews = Array.isArray(news)
       ? news
-          .filter(n => n && n.headline && n.url)
+          .filter((n) => n && n.headline && n.url)
           .sort((a, b) => (b.datetime || 0) - (a.datetime || 0))
           .slice(0, 6)
+          .map((n) => ({
+            headline: n.headline,
+            source: n.source,
+            url: n.url,
+            datetime: n.datetime,
+          }))
       : [];
 
     const recLatest = Array.isArray(recs) && recs.length ? recs[0] : null;
 
-    // ---- Ask OpenAI for a Robinhood-style insight in strict JSON ----
+    // ---------- JSON Schema the UI expects ----------
     const schema = {
-      name: "crest_insight",
-      schema: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          title: { type: "string" },
-          sentiment: { type: "string", enum: ["up", "down", "neutral"] },
-          updatedLabel: { type: "string" },
-          sections: {
-            type: "array",
-            minItems: 3,
-            maxItems: 6,
-            items: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                heading: { type: "string" },
-                body: { type: "string" },
-              },
-              required: ["heading", "body"],
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        title: { type: "string" },
+        sentiment: { type: "string", enum: ["up", "down", "neutral"] },
+        updatedLabel: { type: "string" },
+        sections: {
+          type: "array",
+          minItems: 3,
+          maxItems: 6,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              heading: { type: "string" },
+              body: { type: "string" },
             },
-          },
-          citations: {
-            type: "array",
-            maxItems: 6,
-            items: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                label: { type: "string" },
-                url: { type: "string" },
-              },
-              required: ["label", "url"],
-            },
+            required: ["heading", "body"],
           },
         },
-        required: ["title", "sentiment", "updatedLabel", "sections", "citations"],
+        citations: {
+          type: "array",
+          maxItems: 6,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              label: { type: "string" },
+              url: { type: "string" },
+            },
+            required: ["label", "url"],
+          },
+        },
       },
-      strict: true,
+      required: ["title", "sentiment", "updatedLabel", "sections", "citations"],
     };
 
     const input = [
       {
         role: "system",
         content:
-          "You write concise, retail-investor-friendly market insight in a Robinhood style. Be factual. No hype. No financial advice. Keep sections short and clear.",
+          "Write concise, retail-investor-friendly market insight in a Robinhood style. Be factual. No hype. No financial advice. Keep each section short and clear.",
       },
       {
         role: "user",
@@ -134,12 +134,7 @@ export default async function handler(req, res) {
             profile,
             analyst_recommendation_latest: recLatest,
             price_target: pt,
-            top_news: topNews.map(n => ({
-              headline: n.headline,
-              source: n.source,
-              url: n.url,
-              datetime: n.datetime,
-            })),
+            top_news: topNews,
           },
           null,
           2
@@ -147,13 +142,20 @@ export default async function handler(req, res) {
       },
     ];
 
+    // ✅ IMPORTANT FIX: include text.format.name and schema directly
     const resp = await openai.responses.create({
       model: "gpt-4.1-mini",
       input,
-      text: { format: { type: "json_schema", json_schema: schema } },
+      text: {
+        format: {
+          type: "json_schema",
+          name: "crest_insight",
+          schema,
+          strict: true,
+        },
+      },
     });
 
-    // Responses API returns the JSON text in output_text
     const outText = resp.output_text || "";
     let parsed;
     try {
@@ -161,17 +163,13 @@ export default async function handler(req, res) {
     } catch {
       return res.status(500).json({
         error: "AI returned non-JSON output",
-        debug: outText.slice(0, 500),
+        debug: outText.slice(0, 800),
       });
     }
 
-    // Always include symbol so your frontend can show it if needed
     parsed.symbol = symbol;
-
     return res.status(200).json(parsed);
   } catch (err) {
-    return res.status(500).json({
-      error: err?.message || "Unknown server error",
-    });
+    return res.status(500).json({ error: err?.message || "Unknown server error" });
   }
 }
